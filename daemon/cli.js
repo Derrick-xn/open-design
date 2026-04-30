@@ -37,6 +37,7 @@ const MEDIA_GENERATE_STRING_FLAGS = new Set([
   'voice',
   'audio-kind',
   'composition-dir',
+  'image',
   'daemon-url',
 ]);
 const MEDIA_GENERATE_BOOLEAN_FLAGS = new Set([
@@ -166,6 +167,12 @@ async function runMedia(args) {
     // meta.json / index.html. Daemon validates it stays inside the
     // project before invoking npx.
     compositionDir: flags['composition-dir'],
+    // Project-relative path to a reference image for image-to-video
+    // models (Seedance i2v family) or image-edit endpoints. The daemon
+    // reads the file out of the project dir, base64-encodes it, and
+    // injects it as the model's image input. Path traversal outside
+    // the project is rejected daemon-side.
+    image: flags.image,
   };
   if (flags.length != null) body.length = Number(flags.length);
   if (flags.duration != null) body.duration = Number(flags.duration);
@@ -477,6 +484,11 @@ Common options:
                             to the dir containing hyperframes.json /
                             meta.json / index.html. The daemon runs
                             \`npx hyperframes render\` against it.
+  --image <path>            Project-relative path to a reference image
+                            (image-to-video for Seedance i2v models, or
+                            future image-edit endpoints). Daemon reads
+                            the file from the project, base64-encodes
+                            it, and forwards it to the upstream API.
   --daemon-url http://127.0.0.1:7456
 
 Output: a single line of JSON: {"file": { name, size, kind, mime, ... }}.

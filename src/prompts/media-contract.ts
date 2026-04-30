@@ -193,6 +193,14 @@ showed it crashed).
 
 - **image**:   ${IMAGE_IDS}
 - **video**:   ${VIDEO_IDS}
+  Image-to-video (i2v): the Volcengine Seedance family
+  (\`doubao-seedance-2-0-260128\`, \`doubao-seedance-2-0-fast-260128\`,
+  \`doubao-seedance-1-0-pro-250528\`, \`doubao-seedance-1-0-lite-i2v-250428\`)
+  accepts a reference image as the first frame. Pass it via
+  \`--image <project-relative-path>\` to \`od media generate\`. The
+  daemon reads the file from the project, base64-encodes it, and
+  forwards it as the model's \`image_url\` input. Path traversal
+  outside the project is rejected.
 - **audio · music**:  ${AUDIO_MUSIC_IDS}
 - **audio · speech**: ${AUDIO_SPEECH_IDS}
 - **audio · sfx**:    ${AUDIO_SFX_IDS}

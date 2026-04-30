@@ -85,6 +85,71 @@ function stubsAllowed() {
   return v === '1' || v === 'true';
 }
 
+/**
+ * Resolve a project-relative `--image` path into a base64 data URL the
+ * upstream model APIs (Volcengine i2v, OpenAI image-edit, etc.) accept
+ * directly. Returns null when no path was supplied.
+ *
+ * Security: refuses anything that escapes the project directory.
+ * Without this guard, an agent (or a hallucinated arg) could ask the
+ * daemon to upload `/etc/passwd` to a paid model.
+ */
+async function resolveProjectImage(rel, projectDir) {
+  if (typeof rel !== 'string' || !rel.trim()) return null;
+  const projectRootResolved = path.resolve(projectDir);
+  const abs = path.resolve(projectRootResolved, rel.trim());
+  if (
+    abs !== projectRootResolved &&
+    !abs.startsWith(projectRootResolved + path.sep)
+  ) {
+    throw new Error(
+      `--image path "${rel}" resolves outside the project directory.`,
+    );
+  }
+  let info;
+  try {
+    info = await stat(abs);
+  } catch {
+    throw new Error(`--image not found: ${rel}`);
+  }
+  if (!info.isFile()) {
+    throw new Error(`--image is not a regular file: ${rel}`);
+  }
+  // Cap at 16 MB. Beyond this, base64 inflation alone (≈4/3) starts
+  // hitting body-size limits at the upstream APIs and our own express
+  // 4mb body cap on inbound requests; bigger payloads should travel
+  // via the dedicated upload endpoint, not the dispatcher.
+  const MAX_IMAGE_BYTES = 16 * 1024 * 1024;
+  if (info.size > MAX_IMAGE_BYTES) {
+    throw new Error(
+      `--image too large (${info.size} bytes; max ${MAX_IMAGE_BYTES}).`,
+    );
+  }
+  const bytes = await readFile(abs);
+  const ext = path.extname(abs).toLowerCase();
+  // Tight allowlist: only what i2v / image-edit endpoints actually
+  // consume. Avoids smuggling arbitrary content through as data URLs.
+  const mime = ({
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+  })[ext];
+  if (!mime) {
+    throw new Error(
+      `--image has unsupported extension "${ext}". Use png, jpg, jpeg, webp, or gif.`,
+    );
+  }
+  return {
+    path: rel.trim(),
+    abs,
+    mime,
+    size: bytes.length,
+    dataUrl: `data:${mime};base64,${bytes.toString('base64')}`,
+  };
+}
+
 function clampNumber(value, allowed) {
   // Accept exact registry values; otherwise snap to the nearest allowed
   // bucket so a hallucinated `Number.MAX_SAFE_INTEGER` can't bill an
@@ -152,6 +217,7 @@ export async function generateMedia(args) {
     voice,
     audioKind,
     compositionDir,
+    image,
   } = args;
 
   if (!projectRoot) throw new Error('projectRoot required');
@@ -215,6 +281,13 @@ export async function generateMedia(args) {
   const target = path.join(dir, safeOut);
   await mkdir(path.dirname(target), { recursive: true });
 
+  // Reference image for image-to-video / image-edit flows. The agent
+  // passes a project-relative path; we read it once here, validate it
+  // stays inside the project, and turn it into a base64 data URL the
+  // upstream APIs accept directly. Renderers consume `ctx.imageRef`
+  // and decide how to splice the data URL into their request.
+  const imageRef = await resolveProjectImage(image, dir);
+
   const ctx = {
     surface,
     model,
@@ -230,6 +303,9 @@ export async function generateMedia(args) {
     // hyperframes.json / meta.json / index.html. Only consumed by the
     // hyperframes renderer; null/empty for every other provider.
     compositionDir: typeof compositionDir === 'string' ? compositionDir : null,
+    // Resolved reference image for i2v / image-edit flows. `null` when
+    // the agent didn't pass --image. See resolveProjectImage below.
+    imageRef,
   };
 
   const credentials = await resolveProviderConfig(projectRoot, def.provider);
@@ -699,9 +775,22 @@ async function renderVolcengineVideo(ctx, credentials) {
     ? `${promptText} ${suffixFlags.join(' ')}`
     : promptText;
 
+  // Seedance i2v (and seedance-2.0/-fast which support both modes)
+  // accept an additional `image_url` content entry — Volcengine treats
+  // it as the first frame and animates from there. We pass the data
+  // URL directly; the API does not require a public URL. When no
+  // image is provided, this is a regular t2v call.
+  const content = [{ type: 'text', text: fullText }];
+  if (ctx.imageRef && ctx.imageRef.dataUrl) {
+    content.push({
+      type: 'image_url',
+      image_url: { url: ctx.imageRef.dataUrl },
+    });
+  }
+
   const taskBody = {
     model: ctx.model,
-    content: [{ type: 'text', text: fullText }],
+    content,
   };
 
   const taskResp = await fetch(`${baseUrl}/contents/generations/tasks`, {
@@ -725,10 +814,12 @@ async function renderVolcengineVideo(ctx, credentials) {
   const taskId = taskData && taskData.id;
   if (!taskId) throw new Error('volcengine task response missing id');
 
-  // Poll until succeeded/failed. Cap at ~3 minutes — Seedance 2.0 fast
-  // returns in 30-60s, the standard model can take 90-120s.
+  // Poll until succeeded/failed. Cap at ~6 minutes — Seedance 2.0 fast
+  // t2v returns in 30-60s, the standard t2v model can take 90-120s,
+  // and i2v with a real photoreal reference frame routinely runs
+  // 3-5 minutes on the standard 2.0 / 1.0-pro models.
   const startedAt = Date.now();
-  const maxMs = 3 * 60 * 1000;
+  const maxMs = 6 * 60 * 1000;
   let videoUrl = null;
   let lastStatus = '';
   while (Date.now() - startedAt < maxMs) {

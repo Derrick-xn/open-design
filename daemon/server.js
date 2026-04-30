@@ -1010,6 +1010,7 @@ export async function startServer({ port = 7456, returnServer = false } = {}) {
         voice: req.body?.voice,
         audioKind: req.body?.audioKind,
         compositionDir: req.body?.compositionDir,
+        image: req.body?.image,
         onProgress: wantsStream
           ? (line) => sendEvent('progress', { line })
           : undefined,
