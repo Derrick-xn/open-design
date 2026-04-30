@@ -67,20 +67,33 @@ npx hyperframes init "$COMP" --example blank --skip-skills --non-interactive
 #    unsandboxed process. (Many agent CLIs, Claude Code in particular,
 #    wrap Bash in macOS sandbox-exec under which puppeteer's Chrome
 #    subprocess hangs partway through frame capture. The daemon process
-#    is unsandboxed, so renders complete reliably and stream
-#    per-frame progress back to your chat in real time.)
-node "$OD_BIN" media generate \
+#    is unsandboxed, so renders complete reliably.)
+#
+#    The dispatcher returns within ~1s with a {taskId}; drive the
+#    render to completion by looping `od media wait <taskId>` calls.
+#    Each call long-polls up to 25s (well under your shell tool's
+#    default 30s cap) and exits 0/2/5 to signal done/running/failed.
+out=$(node "$OD_BIN" media generate \
   --project "$OD_PROJECT_ID" \
   --surface video \
   --model hyperframes-html \
   --output "<descriptive-name>.mp4" \
-  --composition-dir "$COMP_REL"
+  --composition-dir "$COMP_REL")
+ec=$?
+task_id=$(printf '%s\n' "$out" | tail -1 | jq -r '.taskId // empty')
+since=$(printf '%s\n' "$out" | tail -1 | jq -r '.nextSince // 0')
+while [ "$ec" -eq 2 ] && [ -n "$task_id" ]; do
+  out=$(node "$OD_BIN" media wait "$task_id" --since "$since")
+  ec=$?
+  since=$(printf '%s\n' "$out" | tail -1 | jq -r '.nextSince // '"$since")
+done
+[ "$ec" -ne 0 ] && { echo "$out" >&2; exit "$ec"; }
 ```
 
-The dispatcher streams per-line render progress to your stderr while
-running (HF prints `Capturing frame N/M` for each captured frame), so
-the user sees live progress in chat instead of a silent spinner.
-After it finishes it prints a one-line JSON
+Each `generate` and each `wait` call lasts at most ~25s, so the agent
+shell tool's default ~30s cap never fires. Progress lines from HF
+(`Capturing frame N/M`) stream to stderr live throughout the loop.
+When the render finishes, the last stdout line is
 `{"file": { "name": "<output>", "size": …, "kind": "video", … }}` —
 quote `file.name` in your reply so the user knows what was produced.
 

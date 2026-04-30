@@ -113,16 +113,22 @@ async function runMedia(args) {
     printMediaHelp();
     return;
   }
-  if (sub !== 'generate') {
+  if (sub !== 'generate' && sub !== 'wait') {
     console.error(`unknown subcommand: od media ${sub}`);
     printMediaHelp();
     process.exit(1);
   }
 
   const idx = args.indexOf(sub);
+  const subArgs = [...args.slice(0, idx), ...args.slice(idx + 1)];
+  if (sub === 'wait') return runMediaWait(subArgs);
+  return runMediaGenerate(subArgs);
+}
+
+async function runMediaGenerate(rawArgs) {
   let flags;
   try {
-    flags = parseFlags([...args.slice(0, idx), ...args.slice(idx + 1)], {
+    flags = parseFlags(rawArgs, {
       string: MEDIA_GENERATE_STRING_FLAGS,
       boolean: MEDIA_GENERATE_BOOLEAN_FLAGS,
     });
@@ -154,24 +160,12 @@ async function runMedia(args) {
   const body = {
     surface,
     model: flags.model,
-    // Prompts remain opaque text all the way through the daemon and must
-    // never be shell-interpolated by downstream providers. Every current
-    // renderer uses fetch + JSON bodies, not exec/spawn.
     prompt: flags.prompt,
     output: flags.output,
     aspect: flags.aspect,
     voice: flags.voice,
     audioKind: flags['audio-kind'],
-    // Only consumed by `--model hyperframes-html`. Project-relative
-    // path the agent has already populated with hyperframes.json /
-    // meta.json / index.html. Daemon validates it stays inside the
-    // project before invoking npx.
     compositionDir: flags['composition-dir'],
-    // Project-relative path to a reference image for image-to-video
-    // models (Seedance i2v family) or image-edit endpoints. The daemon
-    // reads the file out of the project dir, base64-encodes it, and
-    // injects it as the model's image input. Path traversal outside
-    // the project is rejected daemon-side.
     image: flags.image,
   };
   if (flags.length != null) body.length = Number(flags.length);
@@ -182,224 +176,205 @@ async function runMedia(args) {
   try {
     resp = await fetch(url, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        // Opt into Server-Sent Events so the daemon can stream
-        // per-line render progress back to us during long-running
-        // generations (HyperFrames in particular: 60–120s of frame
-        // capture). We forward each progress line to stderr so the
-        // agent's shell tool prints them in the chat in real time —
-        // without this, the user sees a silent spinner for the whole
-        // render and assumes the call has hung.
-        accept: 'text/event-stream, application/json;q=0.9',
-      },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     });
   } catch (err) {
-    // undici's top-level message for connect failures is the unhelpful
-    // `fetch failed` — the actual reason lives on `err.cause`. Drill into
-    // it so the agent (and any human reading the log) sees the real
-    // condition: `ECONNREFUSED` if the port is dead, `EPERM` /
-    // `ENETUNREACH` if a sandbox blocked the dial (typical when running
-    // under Codex `workspace-write` without `network_access=true`),
-    // `ENOTFOUND` for DNS, etc.
-    const cause = err && typeof err === 'object' ? err.cause : null;
-    const code =
-      cause && typeof cause === 'object' && typeof cause.code === 'string'
-        ? cause.code
-        : null;
-    const causeMsg =
-      cause && typeof cause === 'object' && typeof cause.message === 'string'
-        ? cause.message
-        : '';
-    let detail = err && err.message ? err.message : String(err);
-    if (code) detail = `${code}${causeMsg ? ` — ${causeMsg}` : ''}`;
-    else if (causeMsg) detail = causeMsg;
-    console.error(`failed to reach daemon at ${daemonUrl}: ${detail}`);
-    if (code === 'EPERM' || code === 'ENETUNREACH') {
-      console.error(
-        'hint: outbound connect was denied by a sandbox. If you launched ' +
-          'this command from a code agent, check the agent\'s sandbox / ' +
-          'network policy. The OD daemon itself is unaffected — it can be ' +
-          'reached from a regular shell.',
-      );
-    }
+    surfaceFetchError(err, daemonUrl);
     process.exit(3);
   }
-  const contentType = resp.headers.get('content-type') || '';
-  let parsed = null;
-  let rawBody = '';
+  if (!resp.ok) {
+    const text = await resp.text();
+    console.error(`daemon ${resp.status}: ${text}`);
+    process.exit(4);
+  }
+  const accepted = await resp.json();
+  const { taskId } = accepted;
+  if (!taskId) {
+    console.error('daemon did not return a taskId');
+    process.exit(4);
+  }
+  // Echo the taskId on stderr early so an agent watching the chat sees
+  // the dispatch landed even if the next /wait call gets killed.
+  console.error(`task ${taskId} queued (${accepted.status || 'queued'})`);
+  // Hand off to the same poll loop runMediaWait uses, starting from
+  // progress index 0 (no events yet).
+  await pollUntilDoneOrBudget(daemonUrl, taskId, 0);
+}
 
-  if (contentType.includes('text/event-stream')) {
-    // Streaming response. Pipe `progress` events to stderr line by line
-    // so the agent's chat shows live render progress. Capture the
-    // single `result` event (or `error` event) for the JSON we hand
-    // back on stdout / use to set the exit code.
-    const result = await consumeEventStream(resp, (line) => {
-      // Forward HF's progress lines verbatim. They're already short
-      // (HF strips its own progress bar to a single "Capturing frame
-      // X/N" form once we strip ANSI on the daemon side).
-      process.stderr.write(line + '\n');
+async function runMediaWait(rawArgs) {
+  // parseFlags rejects positional args, but `wait` takes the taskId as
+  // a positional. Pull it out first, then feed only the flag-shaped
+  // tokens through parseFlags.
+  const taskId = rawArgs.find((a) => a && !a.startsWith('--'));
+  if (!taskId) {
+    console.error('usage: od media wait <taskId> [--since <n>] [--daemon-url <url>]');
+    process.exit(2);
+  }
+  const flagsOnly = rawArgs.filter((a) => a !== taskId);
+  let flags;
+  try {
+    flags = parseFlags(flagsOnly, {
+      string: new Set(['since', 'daemon-url']),
+      boolean: new Set(['help', 'h']),
     });
-    if (result.kind === 'error') {
-      const status = typeof result.status === 'number' ? result.status : resp.status;
-      console.error(`daemon ${status}: ${result.error || 'unknown error'}`);
-      process.exit(4);
-    }
-    parsed = result.payload;
-    rawBody = JSON.stringify(parsed);
-  } else {
-    rawBody = await resp.text();
-    if (!resp.ok) {
-      console.error(`daemon ${resp.status}: ${rawBody}`);
-      process.exit(4);
-    }
-    try {
-      parsed = JSON.parse(rawBody);
-    } catch {
-      parsed = null;
-    }
+  } catch (err) {
+    console.error(err.message);
+    printMediaHelp();
+    process.exit(2);
   }
-
-  // The daemon sometimes "succeeds" by writing a stub fallback after the
-  // real provider call failed (so the agent's chat loop doesn't dead-end).
-  // Inspect the response and shout the failure on stderr so a code agent
-  // sees it clearly: stdout stays a single JSON line for parsing, stderr
-  // carries the human-readable warning that maps onto a chat warning.
-  const file = parsed && parsed.file;
-  const warnings = file && Array.isArray(file.warnings) ? file.warnings : [];
-  for (const warning of warnings) {
-    if (typeof warning === 'string' && warning) {
-      console.error(`WARN: ${warning}`);
-    }
-  }
-  if (file && file.providerError) {
-    const provider = file.providerId || 'provider';
-    console.error(
-      `WARN: ${provider} call failed — wrote stub fallback (${file.size} bytes) to ${file.name}`,
-    );
-    console.error(`WARN: reason: ${file.providerError}`);
-    console.error(
-      'WARN: surface this verbatim to the user. Do NOT claim the stub is the final result.',
-    );
-  }
-  // Print the JSON response as one line so the agent can parse it.
-  process.stdout.write(rawBody.trim() + '\n');
-  if (file && file.providerError) {
-    // Exit non-zero so shells/agents that gate on $? notice. We use 5
-    // (distinct from 1-4 above) to mean "daemon ok, provider failed".
-    process.exit(5);
-  }
+  const daemonUrl =
+    flags['daemon-url'] || process.env.OD_DAEMON_URL || 'http://127.0.0.1:7456';
+  const since = Number.isFinite(Number(flags.since))
+    ? Number(flags.since)
+    : 0;
+  await pollUntilDoneOrBudget(daemonUrl, taskId, since);
 }
 
 /**
- * Consume a Server-Sent Events response body and dispatch named events.
+ * Drive a media task to completion via the daemon's /wait long-poll
+ * endpoint. Runs at most ~25s of total wall-clock to stay below the
+ * agent Bash tool's default 30s cap, then exits with a hand-off code:
  *
- * We only care about three event names:
- *   - `progress` → call `onProgress(line)` for each emitted line
- *   - `result`   → resolve with the final `{file: {...}}` payload
- *   - `error`    → resolve with `{kind: 'error', error, status}` so the
- *                  caller can map it to an exit code
+ *   exit 0  → terminal `done`. Final JSON `{file:{...}}` printed on stdout.
+ *   exit 5  → terminal `failed`. Error message on stderr.
+ *   exit 2  → still `running`. `{taskId, status:'running', nextSince}` on
+ *             stdout so the agent can call `od media wait <taskId>
+ *             --since <nextSince>` to continue from where we left off.
+ *   exit 3  → daemon unreachable.
+ *   exit 4  → daemon returned a non-2xx (e.g. 404 task-not-found).
  *
- * Any unrecognised event name is ignored. SSE comments (lines starting
- * with `:`) are also ignored — the daemon emits them every 5s as
- * heartbeats so middleboxes don't drop the long-lived connection.
+ * Progress lines arrive on stderr live (one per upstream event) AND
+ * are mirrored to stdout with a `# ` prefix so cc's Bash tool (which
+ * keeps the call alive on stdout activity) sees fresh bytes between
+ * polls. The final JSON line is always last on stdout, so any agent
+ * that parses "the last stdout line" as JSON keeps working.
  */
-async function consumeEventStream(resp, onProgress) {
-  if (!resp.body) {
-    return { kind: 'error', error: 'daemon returned no body for streamed request' };
-  }
-  // undici's `body` exposes a Web ReadableStream; getReader() gives us
-  // chunked Uint8Arrays we can decode incrementally.
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder('utf-8');
-  let buf = '';
-  let pendingEvent = null;
-  let pendingDataLines = [];
+async function pollUntilDoneOrBudget(daemonUrl, taskId, sinceStart) {
+  // Total wall-clock budget for this single CLI invocation. Picked at
+  // 25s so even with a slow 4s HTTP round-trip we still return well
+  // below the 30s agent Bash default.
+  const totalBudgetMs = 25_000;
+  // Per-call /wait budget. 4s leaves room for >5 ticks within our
+  // 25s envelope when the task is producing fast progress, and one
+  // graceful timeout when it isn't.
+  const perCallTimeoutMs = 4_000;
+  const startedAt = Date.now();
+  const url = `${daemonUrl.replace(/\/$/, '')}/api/media/tasks/${encodeURIComponent(taskId)}/wait`;
 
-  const flushEvent = () => {
-    if (pendingEvent == null && pendingDataLines.length === 0) return null;
-    const event = pendingEvent || 'message';
-    const data = pendingDataLines.join('\n');
-    pendingEvent = null;
-    pendingDataLines = [];
-    return { event, data };
+  let since = Number.isFinite(sinceStart) ? sinceStart : 0;
+  let lastSnapshot = null;
+
+  while (Date.now() - startedAt < totalBudgetMs) {
+    const remaining = totalBudgetMs - (Date.now() - startedAt);
+    const callTimeout = Math.max(500, Math.min(perCallTimeoutMs, remaining));
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ since, timeoutMs: callTimeout }),
+      });
+    } catch (err) {
+      surfaceFetchError(err, daemonUrl);
+      process.exit(3);
+    }
+    if (resp.status === 404) {
+      console.error(`task ${taskId} not found (expired or never queued)`);
+      process.exit(4);
+    }
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.error(`daemon ${resp.status}: ${text}`);
+      process.exit(4);
+    }
+    let snap;
+    try {
+      snap = await resp.json();
+    } catch {
+      console.error('daemon returned non-JSON for /wait');
+      process.exit(4);
+    }
+    lastSnapshot = snap;
+    // Forward any new progress lines.
+    if (Array.isArray(snap.progress)) {
+      for (const line of snap.progress) {
+        process.stderr.write(line + '\n');
+        process.stdout.write(`# ${line}\n`);
+      }
+    }
+    if (typeof snap.nextSince === 'number') since = snap.nextSince;
+
+    if (snap.status === 'done') {
+      const file = snap.file || {};
+      const warnings = Array.isArray(file.warnings) ? file.warnings : [];
+      for (const w of warnings) {
+        if (typeof w === 'string' && w) console.error(`WARN: ${w}`);
+      }
+      if (file.providerError) {
+        const provider = file.providerId || 'provider';
+        console.error(
+          `WARN: ${provider} call failed — wrote stub fallback (${file.size} bytes) to ${file.name}`,
+        );
+        console.error(`WARN: reason: ${file.providerError}`);
+        console.error(
+          'WARN: surface this verbatim to the user. Do NOT claim the stub is the final result.',
+        );
+      }
+      process.stdout.write(JSON.stringify({ file }) + '\n');
+      process.exit(file.providerError ? 5 : 0);
+    }
+    if (snap.status === 'failed') {
+      const msg = snap.error?.message || 'task failed';
+      console.error(`task failed: ${msg}`);
+      process.stdout.write(
+        JSON.stringify({ taskId, status: 'failed', error: snap.error || {} }) + '\n',
+      );
+      process.exit(snap.error?.status || 5);
+    }
+    // Still running — loop and poll again unless we're out of budget.
+  }
+
+  // Out of CLI budget but task is still running. Tell the caller how
+  // to continue and exit 2 — the agent watches for this and re-issues
+  // `od media wait <taskId> --since <nextSince>` to resume.
+  const handoff = {
+    taskId,
+    status: lastSnapshot?.status || 'running',
+    nextSince: since,
+    elapsed: Math.round((Date.now() - startedAt) / 1000),
   };
+  process.stdout.write(JSON.stringify(handoff) + '\n');
+  process.stderr.write(
+    `task ${taskId} still running after ${handoff.elapsed}s. ` +
+      `Run \`od media wait ${taskId} --since ${since}\` to continue ` +
+      `(exit code 2 = still running).\n`,
+  );
+  process.exit(2);
+}
 
-  let result = null;
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-
-    // Process complete lines; SSE messages are separated by a blank line
-    // (`\n\n`). We process line-by-line, emitting on the blank.
-    let nl;
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl).replace(/\r$/, '');
-      buf = buf.slice(nl + 1);
-      if (line === '') {
-        const ev = flushEvent();
-        if (!ev) continue;
-        if (ev.event === 'progress') {
-          let payload;
-          try {
-            payload = JSON.parse(ev.data);
-          } catch {
-            payload = { line: ev.data };
-          }
-          if (typeof onProgress === 'function' && typeof payload?.line === 'string') {
-            onProgress(payload.line);
-          }
-          continue;
-        }
-        if (ev.event === 'result') {
-          try {
-            result = { kind: 'result', payload: JSON.parse(ev.data) };
-          } catch {
-            result = { kind: 'error', error: `bad result payload: ${ev.data.slice(0, 200)}` };
-          }
-          continue;
-        }
-        if (ev.event === 'error') {
-          let parsed;
-          try {
-            parsed = JSON.parse(ev.data);
-          } catch {
-            parsed = { error: ev.data };
-          }
-          result = { kind: 'error', error: parsed.error, status: parsed.status };
-          continue;
-        }
-        // Unknown event names are ignored.
-        continue;
-      }
-      if (line.startsWith(':')) continue; // heartbeat / comment
-      if (line.startsWith('event:')) {
-        pendingEvent = line.slice(6).trim();
-        continue;
-      }
-      if (line.startsWith('data:')) {
-        // Per spec, a single leading space after the colon is stripped.
-        const v = line.slice(5);
-        pendingDataLines.push(v.startsWith(' ') ? v.slice(1) : v);
-        continue;
-      }
-      // Other SSE fields (id, retry) we don't use.
-    }
+function surfaceFetchError(err, daemonUrl) {
+  const cause = err && typeof err === 'object' ? err.cause : null;
+  const code =
+    cause && typeof cause === 'object' && typeof cause.code === 'string'
+      ? cause.code
+      : null;
+  const causeMsg =
+    cause && typeof cause === 'object' && typeof cause.message === 'string'
+      ? cause.message
+      : '';
+  let detail = err && err.message ? err.message : String(err);
+  if (code) detail = `${code}${causeMsg ? ` — ${causeMsg}` : ''}`;
+  else if (causeMsg) detail = causeMsg;
+  console.error(`failed to reach daemon at ${daemonUrl}: ${detail}`);
+  if (code === 'EPERM' || code === 'ENETUNREACH') {
+    console.error(
+      'hint: outbound connect was denied by a sandbox. If you launched ' +
+        'this command from a code agent, check the agent\'s sandbox / ' +
+        'network policy. The OD daemon itself is unaffected — it can be ' +
+        'reached from a regular shell.',
+    );
   }
-  // Flush trailing buffered event if the stream ended without a blank.
-  if (pendingDataLines.length || pendingEvent) {
-    const ev = flushEvent();
-    if (ev?.event === 'result' && !result) {
-      try {
-        result = { kind: 'result', payload: JSON.parse(ev.data) };
-      } catch {
-        // ignore
-      }
-    }
-  }
-  return result || { kind: 'error', error: 'event stream closed without a result' };
 }
 
 // Tolerant of two shapes the LLM might emit:

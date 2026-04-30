@@ -340,7 +340,7 @@ export async function generateMedia(args) {
       providerNote = result.providerNote;
       suggestedExt = result.suggestedExt;
     } else if (def.provider === 'volcengine' && surface === 'video') {
-      const result = await renderVolcengineVideo(ctx, credentials);
+      const result = await renderVolcengineVideo(ctx, credentials, args.onProgress);
       bytes = result.bytes;
       providerNote = result.providerNote;
       suggestedExt = result.suggestedExt;
@@ -752,7 +752,7 @@ async function renderOpenAISpeech(ctx, credentials, fileName) {
 // project folder is required to keep them addressable.
 // ---------------------------------------------------------------------------
 
-async function renderVolcengineVideo(ctx, credentials) {
+async function renderVolcengineVideo(ctx, credentials, onProgress) {
   if (!credentials.apiKey) {
     throw new Error(
       'no Volcengine Ark API key — configure it in Settings or set ARK_API_KEY',
@@ -822,6 +822,16 @@ async function renderVolcengineVideo(ctx, credentials) {
   const maxMs = 6 * 60 * 1000;
   let videoUrl = null;
   let lastStatus = '';
+  // Emit a "task accepted" line right away so the agent's chat shows
+  // something within the first second instead of going silent for the
+  // full poll loop. cc's Bash tool considers a long-quiet pipe stuck
+  // and times out at ~2 minutes — Volcengine i2v routinely takes
+  // 3-5 minutes, so without this stream, every i2v dispatch dies
+  // mid-flight.
+  if (typeof onProgress === 'function') {
+    const mode = ctx.imageRef ? 'i2v' : 't2v';
+    onProgress(`volcengine ${mode} task ${taskId} accepted; polling status…`);
+  }
   while (Date.now() - startedAt < maxMs) {
     await sleep(4000);
     const pollResp = await fetch(`${baseUrl}/contents/generations/tasks/${encodeURIComponent(taskId)}`, {
@@ -838,6 +848,14 @@ async function renderVolcengineVideo(ctx, credentials) {
       throw new Error(`volcengine poll non-JSON: ${truncate(pollText, 200)}`);
     }
     lastStatus = pollData.status || '';
+    // Forward each poll tick. Heartbeat doubles as a "command is alive"
+    // signal for the agent's bash tool — the daemon's SSE stream emits
+    // an event for every line, which cc renders into the chat as live
+    // output so its watchdog never marks the call as hung.
+    if (typeof onProgress === 'function') {
+      const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+      onProgress(`volcengine task ${taskId} status=${lastStatus || 'pending'} (elapsed ${elapsedSec}s)`);
+    }
     if (lastStatus === 'succeeded') {
       videoUrl = pollData?.content?.video_url || null;
       break;

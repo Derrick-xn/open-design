@@ -194,6 +194,88 @@ function sendMulterError(res, err) {
   return res.status(500).json({ code: 'UPLOAD_ERROR', error: 'upload failed' });
 }
 
+// ----- Async media task registry --------------------------------------
+//
+// Long-running media generations (HyperFrames render, Volcengine i2v) used
+// to live inside a single blocking POST /api/projects/:id/media/generate
+// request. That worked great until we noticed code-agent CLIs (Claude Code
+// in particular) wrap their Bash tool with an aggressive default timeout
+// (~30s) — any single tool call running longer gets SIGTERM'd, even if
+// it's actively writing stdout. The agent loses the result; the daemon
+// keeps rendering and the file silently appears in the project folder
+// later, but the chat says "Working" forever.
+//
+// The fix is to stop fighting the agent's tool timeout and embrace it.
+// Generation is now strictly two-phase:
+//
+//   1. POST /api/projects/:id/media/generate      → returns {taskId} fast
+//   2. POST /api/media/tasks/:taskId/wait        → long-poll up to 25s
+//
+// `wait` returns whatever progress / final state we have so far; the
+// client (cli.js or the OD UI) calls it in a loop until status flips
+// to `done` or `failed`. Each loop iteration is a fresh HTTP call
+// well under the agent's 30s tool-call cap, so the agent never blows
+// past its budget. The renders themselves still run in this daemon
+// process exactly as before — only the request shape changed.
+//
+// Registry state is intentionally in-memory: tasks live for the daemon
+// process's lifetime. After a task reaches a terminal state we keep it
+// around for ~10 minutes so a slow client can still fetch the final
+// result, then GC it to keep the map bounded.
+const mediaTasks = new Map();
+const TASK_TTL_AFTER_DONE_MS = 10 * 60 * 1000;
+
+function createMediaTask(taskId, projectId, info = {}) {
+  const task = {
+    id: taskId,
+    projectId,
+    status: 'queued',
+    surface: info.surface,
+    model: info.model,
+    progress: [],
+    file: null,
+    error: null,
+    startedAt: Date.now(),
+    endedAt: null,
+    waiters: new Set(),
+  };
+  mediaTasks.set(taskId, task);
+  return task;
+}
+
+function appendTaskProgress(task, line) {
+  task.progress.push(line);
+  notifyTaskWaiters(task);
+}
+
+function notifyTaskWaiters(task) {
+  // Snapshot the set first so wakers that synchronously delete themselves
+  // don't perturb iteration order. Each waker is responsible for the
+  // actual delete + clearTimeout via its own bookkeeping.
+  const wakers = Array.from(task.waiters);
+  for (const w of wakers) {
+    try {
+      w();
+    } catch {
+      /* swallow — never let one bad waker break the rest */
+    }
+  }
+  // GC scheduling: when a task lands in a terminal state we keep it
+  // long enough for late clients to pick up the result, then drop it.
+  if (
+    (task.status === 'done' || task.status === 'failed') &&
+    !task._gcScheduled
+  ) {
+    task._gcScheduled = true;
+    setTimeout(() => {
+      // Don't drop a task with active waiters even past TTL; they'll
+      // resolve next tick and the next reaper-eligible entry takes
+      // care of it.
+      if (task.waiters.size === 0) mediaTasks.delete(task.id);
+    }, TASK_TTL_AFTER_DONE_MS).unref?.();
+  }
+}
+
 export async function startServer({ port = 7456, returnServer = false } = {}) {
   const app = express();
   app.use(express.json({ limit: '4mb' }));
@@ -935,67 +1017,33 @@ export async function startServer({ port = 7456, returnServer = false } = {}) {
         .status(403)
         .json({ error: 'cross-origin request rejected: media generation is restricted to the local UI / CLI' });
     }
-    // The CLI client (`od media generate`) sends Accept: text/event-stream
-    // so it can show real-time render progress in the agent's chat. The
-    // browser-side UI doesn't, so it gets the legacy single-shot JSON.
-    // Without streaming, a 60–120s HyperFrames render makes the agent's
-    // shell tool look completely hung — no output until the very end —
-    // and the user can't tell whether anything is happening.
-    const wantsStream =
-      typeof req.headers.accept === 'string' &&
-      req.headers.accept.includes('text/event-stream');
-
-    if (wantsStream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('Connection', 'keep-alive');
-      res.setHeader('X-Accel-Buffering', 'no');
-      res.flushHeaders?.();
-    }
-
-    const sendEvent = (event, payload) => {
-      if (!wantsStream || res.writableEnded) return;
-      // SSE format: each event is a series of `field: value` lines
-      // terminated by a blank line. We use the named-event form so the
-      // client can dispatch on `event` instead of parsing every payload.
-      const data = typeof payload === 'string' ? payload : JSON.stringify(payload);
-      res.write(`event: ${event}\n`);
-      // Multi-line data must be split into multiple `data:` lines per
-      // the SSE spec; otherwise the client only sees the first line.
-      for (const line of data.split('\n')) {
-        res.write(`data: ${line}\n`);
-      }
-      res.write('\n');
-    };
-
-    let heartbeat;
-    if (wantsStream) {
-      // Keep the connection alive across long quiet stretches (puppeteer
-      // bootstrap before frame capture starts can be 5–15s of silence).
-      // SSE comments are ignored by clients but reset proxy idle timers
-      // and prove to the agent's shell tool that the call is still live.
-      heartbeat = setInterval(() => {
-        if (res.writableEnded) return;
-        res.write(`: heartbeat ${Date.now()}\n\n`);
-      }, 5000);
-    }
 
     try {
       const projectId = req.params.id;
-      // Ensure the project exists in DB before writing files; this gives
-      // a friendly 404 when the agent calls with a bad id. The agent
-      // normally inherits OD_PROJECT_ID from spawn env so this should
-      // always resolve.
+      // Ensure the project exists in DB before kicking off the task.
       const project = getProject(db, projectId);
-      if (!project) {
-        if (wantsStream) {
-          sendEvent('error', { error: 'project not found' });
-        } else {
-          res.status(404).json({ error: 'project not found' });
-        }
-        return;
-      }
-      const meta = await generateMedia({
+      if (!project) return res.status(404).json({ error: 'project not found' });
+
+      const taskId = randomUUID();
+      const task = createMediaTask(taskId, projectId, {
+        surface: req.body?.surface,
+        model: req.body?.model,
+      });
+      console.error(
+        `[task ${taskId.slice(0, 8)}] queued model=${req.body?.model} ` +
+          `surface=${req.body?.surface} ` +
+          `image=${req.body?.image ? 'yes' : 'no'} ` +
+          `compositionDir=${req.body?.compositionDir ? 'yes' : 'no'}`,
+      );
+
+      // Kick off render asynchronously. We DO NOT await — we must respond
+      // to the client within a few hundred ms so the agent's Bash tool
+      // doesn't get killed by its default ~30s timeout. The client polls
+      // /api/media/tasks/:id/wait afterward; each /wait call is bounded
+      // at 25s so the agent can drive the render via many short Bash
+      // calls instead of one long-blocking one.
+      task.status = 'running';
+      generateMedia({
         projectRoot: PROJECT_ROOT,
         projectsRoot: PROJECTS_DIR,
         projectId,
@@ -1011,29 +1059,148 @@ export async function startServer({ port = 7456, returnServer = false } = {}) {
         audioKind: req.body?.audioKind,
         compositionDir: req.body?.compositionDir,
         image: req.body?.image,
-        onProgress: wantsStream
-          ? (line) => sendEvent('progress', { line })
-          : undefined,
+        onProgress: (line) => appendTaskProgress(task, line),
+      })
+        .then((meta) => {
+          task.status = 'done';
+          task.file = meta;
+          task.endedAt = Date.now();
+          notifyTaskWaiters(task);
+          console.error(
+            `[task ${taskId.slice(0, 8)}] done size=${meta?.size} mime=${meta?.mime} ` +
+              `elapsed=${Math.round((task.endedAt - task.startedAt) / 1000)}s`,
+          );
+        })
+        .catch((err) => {
+          task.status = 'failed';
+          task.error = {
+            message: String(err && err.message ? err.message : err),
+            status: typeof err?.status === 'number' ? err.status : 400,
+            code: err?.code,
+          };
+          task.endedAt = Date.now();
+          notifyTaskWaiters(task);
+          console.error(
+            `[task ${taskId.slice(0, 8)}] failed status=${task.error.status} ` +
+              `message=${(task.error.message || '').slice(0, 240)}`,
+          );
+        });
+
+      // Always return 202 Accepted with the task envelope. Clients call
+      // POST /api/media/tasks/:id/wait to drive the render.
+      res.status(202).json({
+        taskId,
+        status: task.status,
+        startedAt: task.startedAt,
       });
-      if (wantsStream) {
-        sendEvent('result', { file: meta });
-      } else {
-        res.json({ file: meta });
-      }
     } catch (err) {
       const status = typeof err?.status === 'number' ? err.status : 400;
       const code = err?.code;
       const body = { error: String(err && err.message ? err.message : err) };
       if (code) body.code = code;
-      if (wantsStream) {
-        sendEvent('error', { ...body, status });
-      } else {
-        res.status(status).json(body);
-      }
-    } finally {
-      if (heartbeat) clearInterval(heartbeat);
-      if (wantsStream && !res.writableEnded) res.end();
+      res.status(status).json(body);
     }
+  });
+
+  // Long-poll endpoint for an already-queued media task. Each call blocks
+  // up to 25s waiting for new progress lines or a terminal status change,
+  // then returns the current snapshot. Clients (cli.js, the OD UI) call
+  // this in a loop until status === 'done' | 'failed'. Bounded at 25s
+  // so a single call always fits inside the agent's Bash 30s default
+  // tool timeout.
+  app.post('/api/media/tasks/:id/wait', async (req, res) => {
+    if (!isLocalSameOrigin(req, port)) {
+      return res
+        .status(403)
+        .json({ error: 'cross-origin request rejected' });
+    }
+    const taskId = req.params.id;
+    const task = mediaTasks.get(taskId);
+    if (!task) return res.status(404).json({ error: 'task not found' });
+
+    const since = Number.isFinite(req.body?.since) ? Number(req.body.since) : 0;
+    const requestedTimeout = Number.isFinite(req.body?.timeoutMs)
+      ? Number(req.body.timeoutMs)
+      : 25_000;
+    // Cap timeout at 25s — the agent's Bash tool's default 30s timeout
+    // is the binding constraint; we want the response to land before
+    // the tool gets SIGTERM'd, with a few seconds of margin for HTTP
+    // round-trip.
+    const timeoutMs = Math.min(Math.max(requestedTimeout, 0), 25_000);
+
+    const respond = () => {
+      if (res.writableEnded) return;
+      const snapshot = {
+        taskId,
+        status: task.status,
+        startedAt: task.startedAt,
+        endedAt: task.endedAt,
+        progress: task.progress.slice(since),
+        nextSince: task.progress.length,
+      };
+      if (task.status === 'done') snapshot.file = task.file;
+      if (task.status === 'failed') snapshot.error = task.error;
+      res.json(snapshot);
+    };
+
+    // Already terminal or new progress already pending → reply now.
+    if (
+      task.status === 'done' ||
+      task.status === 'failed' ||
+      task.progress.length > since
+    ) {
+      return respond();
+    }
+
+    // Otherwise long-poll. Wake on progress append, status change, or
+    // timeout, whichever comes first. Also bail if the client closes
+    // the connection so we don't leave the waiter dangling.
+    let resolved = false;
+    const wake = () => {
+      if (resolved) return;
+      resolved = true;
+      task.waiters.delete(wake);
+      clearTimeout(timer);
+      respond();
+    };
+    task.waiters.add(wake);
+    const timer = setTimeout(wake, timeoutMs);
+    res.on('close', wake);
+  });
+
+  // Discovery endpoint for the OD UI: list active (non-terminal) media
+  // tasks for a project so the chat / file panel can show a live banner
+  // even when the agent's bash tool died and lost the taskId.
+  app.get('/api/projects/:id/media/tasks', (req, res) => {
+    if (!isLocalSameOrigin(req, port)) {
+      return res
+        .status(403)
+        .json({ error: 'cross-origin request rejected' });
+    }
+    const projectId = req.params.id;
+    const includeDone =
+      req.query.includeDone === '1' || req.query.includeDone === 'true';
+    const tasks = [];
+    for (const t of mediaTasks.values()) {
+      if (t.projectId !== projectId) continue;
+      const isTerminal = t.status === 'done' || t.status === 'failed';
+      if (isTerminal && !includeDone) continue;
+      tasks.push({
+        taskId: t.id,
+        status: t.status,
+        startedAt: t.startedAt,
+        endedAt: t.endedAt,
+        elapsed: Math.round(((t.endedAt ?? Date.now()) - t.startedAt) / 1000),
+        surface: t.surface,
+        model: t.model,
+        progress: t.progress.slice(-3), // last few lines for a banner
+        progressCount: t.progress.length,
+        ...(t.status === 'done' ? { file: t.file } : {}),
+        ...(t.status === 'failed' ? { error: t.error } : {}),
+      });
+    }
+    tasks.sort((a, b) => b.startedAt - a.startedAt);
+    res.json({ tasks });
   });
 
   // Multi-file upload that the chat composer uses for paste/drop/picker.
